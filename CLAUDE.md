@@ -51,10 +51,14 @@ Keep events **one line each**, with text fields JSON-encoded so newlines survive
 Sync from the agent side. Verbs are the stable API surface. Adding a verb is cheap; renaming one will break every consumer — think twice before. The ones in place now:
 
 ```
-SAY / SAYFILE / REPLY / REPLYFILE / TYPING / DOCUMENT / PHOTO / EDIT / KEYBOARD / BAN / QUIT
+SAY / SAYFILE / SAYHTML / SAYFILEHTML /
+REPLY / REPLYFILE / REPLYHTML / REPLYFILEHTML /
+TYPING / DOCUMENT / PHOTO / EDIT / KEYBOARD / BAN / QUIT
 ```
 
-Text bodies on `SAY` / `REPLY` / `EDIT` (and `DOCUMENT` / `PHOTO` captions) accept two-char escapes — `\n` → newline, `\t` → tab, `\\` → backslash — so senders can emit short multi-line messages despite the FIFO being newline-delimited. Anything longer or containing shell-fragile characters should use `SAYFILE` / `REPLYFILE`: sender writes the body to any UTF-8 file path, verb points at the path, bot reads raw (newlines preserved), auto-chunks at 4000 chars, and unlinks on success. This is the authoritative wire format — keep the bot-side list in `bot.py`, the maintainer doc here, and the public README (`### FIFO verbs`) in sync whenever you add or rename a verb.
+Text bodies on `SAY` / `REPLY` / `EDIT` / `SAYHTML` / `REPLYHTML` (and `DOCUMENT` / `PHOTO` captions) accept two-char escapes — `\n` → newline, `\t` → tab, `\\` → backslash — so senders can emit short multi-line messages despite the FIFO being newline-delimited. Anything longer or containing shell-fragile characters should use the file verbs (`SAYFILE` / `REPLYFILE` / `SAYFILEHTML` / `REPLYFILEHTML`): sender writes the body to any UTF-8 file path, verb points at the path, bot reads raw (newlines preserved), auto-chunks at 4000 chars, and unlinks on success. This is the authoritative wire format — keep the bot-side list in `bot.py`, the maintainer doc here, and the public README (`### FIFO verbs`) in sync whenever you add or rename a verb.
+
+The `*HTML` variants send with `parse_mode=HTML` (Telegram subset: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`, `<pre>`, `<a href>`, `<blockquote>`, `<tg-spoiler>`; literal `<`, `>`, `&` must be entity-escaped). MarkdownV2 is intentionally not offered — its escaping rules for `.`, `!`, `-`, `(`, `)` etc. outside entities are too brittle to generate reliably. If Telegram rejects a body as unparseable, the bot emits `MARKUP_ERROR <chat_id> <path_or_dash> <json_detail>` (distinct from generic `ERROR`) and — for the file verbs — keeps the file on disk so the agent can rewrite and resubmit the same path. Non-parse `BadRequest`s still surface as `ERROR`.
 
 ## Authorization
 

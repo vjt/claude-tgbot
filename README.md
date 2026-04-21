@@ -97,8 +97,9 @@ PHOTO     <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publ
 COMMAND   <chat_id> <msg_id> <cmd> args=<json>  user=<username> role=<admin|publisher>
 CALLBACK  <chat_id> <msg_id> <json_data>        user=<username> role=<admin|publisher>
 IDENTIFY  chat_id=<n> user_id=<n> username=<s>  role=<admin|publisher|none>
-DENIED    <kind>     user_id=<n> chat_id=<n>    username=<s>
-ERROR     <stage>    <detail>
+DENIED       <kind>     user_id=<n> chat_id=<n>    username=<s>
+MARKUP_ERROR <chat_id>  <path_or_dash> <json_detail>
+ERROR        <stage>    <detail>
 ```
 
 Text fields are JSON-encoded so newlines and quotes survive single-line emission.
@@ -106,25 +107,33 @@ Text fields are JSON-encoded so newlines and quotes survive single-line emission
 ### FIFO verbs
 
 ```
-SAY        <chat_id> <text>
-SAYFILE    <chat_id> <path>
-REPLY      <chat_id> <msg_id> <text>
-REPLYFILE  <chat_id> <msg_id> <path>
-TYPING     <chat_id>
-DOCUMENT   <chat_id> <path> [caption]
-PHOTO      <chat_id> <path> [caption]
-EDIT       <chat_id> <msg_id> <text>
-KEYBOARD   <chat_id> <reply_to_msg_id|0> <json_payload>
-BAN        <chat_id> <user_id>
+SAY            <chat_id> <text>
+SAYFILE        <chat_id> <path>
+SAYHTML        <chat_id> <html>
+SAYFILEHTML    <chat_id> <path>
+REPLY          <chat_id> <msg_id> <text>
+REPLYFILE      <chat_id> <msg_id> <path>
+REPLYHTML      <chat_id> <msg_id> <html>
+REPLYFILEHTML  <chat_id> <msg_id> <path>
+TYPING         <chat_id>
+DOCUMENT       <chat_id> <path> [caption]
+PHOTO          <chat_id> <path> [caption]
+EDIT           <chat_id> <msg_id> <text>
+KEYBOARD       <chat_id> <reply_to_msg_id|0> <json_payload>
+BAN            <chat_id> <user_id>
 QUIT
 ```
 
-Long `SAY` / `REPLY` / `SAYFILE` / `REPLYFILE` bodies are chunked at 4000 chars on newline/space boundaries (Telegram's hard limit is 4096).
+Long `SAY` / `REPLY` / `SAYFILE` / `REPLYFILE` bodies (and their HTML twins) are chunked at 4000 chars on newline/space boundaries (Telegram's hard limit is 4096).
 
 **Text-body handling.** The FIFO is newline-delimited, so a literal LF in a raw `SAY` / `REPLY` / `EDIT` body would split one logical command into two. Two escape hatches:
 
-- **Two-char escapes on in-line bodies.** `\n` → newline, `\t` → tab, `\\` → backslash. Works for `SAY`, `REPLY`, `EDIT`, and `DOCUMENT` / `PHOTO` captions. Adequate for short multi-line acks.
-- **`SAYFILE` / `REPLYFILE` for anything non-trivial.** Write the message body to a UTF-8 text file at any path, then point the verb at that path. The bot reads the file raw (newlines preserved), sends the content as a Telegram text message (auto-chunked at 4000 chars), and `unlink()`s the file on successful send. Preferred for longer bodies or anything containing shell metacharacters — sidesteps the quoting brittleness of inline `printf 'SAY …\n'`.
+- **Two-char escapes on in-line bodies.** `\n` → newline, `\t` → tab, `\\` → backslash. Works for `SAY`, `REPLY`, `EDIT`, `SAYHTML`, `REPLYHTML`, and `DOCUMENT` / `PHOTO` captions. Adequate for short multi-line acks.
+- **`SAYFILE` / `REPLYFILE` (and `*FILEHTML`) for anything non-trivial.** Write the message body to a UTF-8 text file at any path, then point the verb at that path. The bot reads the file raw (newlines preserved), sends the content as a Telegram text message (auto-chunked at 4000 chars), and `unlink()`s the file on successful send. Preferred for longer bodies or anything containing shell metacharacters — sidesteps the quoting brittleness of inline `printf 'SAY …\n'`.
+
+**Formatted output (HTML).** The `*HTML` variants send with `parse_mode=HTML`. Telegram's HTML subset is small: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`, `<pre>`, `<a href="…">`, `<blockquote>`, `<tg-spoiler>`. Literal `<`, `>`, `&` must be escaped as `&lt;`, `&gt;`, `&amp;`. MarkdownV2 is deliberately not offered — its escaping rules (every `.`, `!`, `-`, `(`, `)`, `=` outside entities) are too brittle to generate reliably.
+
+If Telegram rejects the body as unparseable, the bot emits a dedicated `MARKUP_ERROR <chat_id> <path_or_dash> <json_detail>` event (not a generic `ERROR`). For `*FILEHTML` verbs the file is **not** unlinked, so the sender can rewrite it in place and resubmit the same verb. For inline HTML verbs the path field is `-` and the sender retries with a corrected body. Chunking is naive: if a `<b>…</b>` straddles the 4000-char boundary the first chunk fails to parse. Keep HTML bodies short, or structure them so each paragraph stands alone.
 
 `KEYBOARD` payload is a JSON array of rows of buttons:
 

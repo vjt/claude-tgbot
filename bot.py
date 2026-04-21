@@ -16,13 +16,18 @@ Events emitted to stdout (one line each, JSON-quoted text fields):
   CALLBACK <chat_id> <msg_id> <json_data> user=<username>
   IDENTIFY chat_id=<n> user_id=<n> username=<s>
   DENIED <kind> user_id=<n> chat_id=<n> username=<s>
+  MARKUP_ERROR <chat_id> <path_or_dash> <json_detail>
   ERROR <stage> <detail>
 
 FIFO verbs (one per line written to bot.send):
   SAY <chat_id> <text>
   SAYFILE <chat_id> <path>
+  SAYHTML <chat_id> <html>
+  SAYFILEHTML <chat_id> <path>
   REPLY <chat_id> <msg_id> <text>
   REPLYFILE <chat_id> <msg_id> <path>
+  REPLYHTML <chat_id> <msg_id> <html>
+  REPLYFILEHTML <chat_id> <msg_id> <path>
   TYPING <chat_id>
   DOCUMENT <chat_id> <path> [caption]
   PHOTO <chat_id> <path> [caption]
@@ -40,6 +45,13 @@ text file to any path and points the verb at it. The bot reads the file
 raw (newlines preserved), sends the content as a Telegram text message
 (auto-chunked), and unlinks the file on successful send. Preferred for
 outbound prose, which doesn't survive brittle shell quoting.
+
+HTML variants (SAYHTML / SAYFILEHTML / REPLYHTML / REPLYFILEHTML) send
+with parse_mode=HTML. Telegram's HTML subset: <b>, <i>, <u>, <s>, <code>,
+<pre>, <a href>, <blockquote>, <tg-spoiler>. Callers must escape literal
+<, >, & as &lt; &gt; &amp;. If Telegram rejects the body as unparseable,
+the bot emits MARKUP_ERROR (not generic ERROR) and — for file verbs —
+keeps the file on disk so the sender can rewrite it and resubmit.
 """
 from __future__ import annotations
 
@@ -57,7 +69,8 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -406,6 +419,39 @@ def _chunk_text(text: str, limit: int = 4000) -> list[str]:
     return out
 
 
+async def _send_chunked(
+    bot,
+    chat_id: int,
+    text: str,
+    reply_to: int | None = None,
+    parse_mode: str | None = None,
+) -> None:
+    """Send a (possibly long) text body as one or more Telegram messages.
+
+    Only the first chunk carries reply_to_message_id so the whole thread
+    anchors to the original message without each chunk quoting it.
+    """
+    first = True
+    for chunk in _chunk_text(text):
+        kw: dict = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            kw["parse_mode"] = parse_mode
+        if first and reply_to:
+            kw["reply_to_message_id"] = reply_to
+        first = False
+        await bot.send_message(**kw)
+
+
+def _is_markup_error(exc: BaseException) -> bool:
+    """Telegram returns BadRequest on invalid HTML markup. Match on message
+    text because BadRequest is also raised for unrelated issues (chat not
+    found, etc.) which should flow to the generic ERROR path instead."""
+    if not isinstance(exc, BadRequest):
+        return False
+    msg = str(exc).lower()
+    return "parse" in msg or "entities" in msg or "tag" in msg
+
+
 def _parse_keyboard_payload(payload: str) -> InlineKeyboardMarkup | None:
     """Payload is JSON: [[{'text':..., 'callback_data':...}, ...], ...]."""
     try:
@@ -440,38 +486,89 @@ async def process_cmd(app: Application, line: str) -> None:
     try:
         if verb == "SAY":
             target, text = _split(rest, 1)
-            for chunk in _chunk_text(_unescape_body(text)):
-                await bot.send_message(chat_id=int(target), text=chunk)
+            await _send_chunked(bot, int(target), _unescape_body(text))
         elif verb == "SAYFILE":
             target, path = _split(rest, 1)
             with open(path, "r", encoding="utf-8") as fh:
                 text = fh.read()
-            for chunk in _chunk_text(text):
-                await bot.send_message(chat_id=int(target), text=chunk)
+            await _send_chunked(bot, int(target), text)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        elif verb == "SAYHTML":
+            target, text = _split(rest, 1)
+            try:
+                await _send_chunked(
+                    bot, int(target), _unescape_body(text), parse_mode=ParseMode.HTML
+                )
+            except BadRequest as e:
+                if _is_markup_error(e):
+                    emit("MARKUP_ERROR", int(target), "-", _one_line(str(e)))
+                    return
+                raise
+        elif verb == "SAYFILEHTML":
+            target, path = _split(rest, 1)
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            try:
+                await _send_chunked(bot, int(target), text, parse_mode=ParseMode.HTML)
+            except BadRequest as e:
+                if _is_markup_error(e):
+                    # Keep file on disk so sender can rewrite and resubmit.
+                    emit("MARKUP_ERROR", int(target), path, _one_line(str(e)))
+                    return
+                raise
             try:
                 os.unlink(path)
             except OSError:
                 pass
         elif verb == "REPLY":
             target, msg_id, text = _split(rest, 2)
-            first = True
-            for chunk in _chunk_text(_unescape_body(text)):
-                kw = {"chat_id": int(target), "text": chunk}
-                if first:
-                    kw["reply_to_message_id"] = int(msg_id)
-                    first = False
-                await bot.send_message(**kw)
+            await _send_chunked(
+                bot, int(target), _unescape_body(text), reply_to=int(msg_id)
+            )
         elif verb == "REPLYFILE":
             target, msg_id, path = _split(rest, 2)
             with open(path, "r", encoding="utf-8") as fh:
                 text = fh.read()
-            first = True
-            for chunk in _chunk_text(text):
-                kw = {"chat_id": int(target), "text": chunk}
-                if first:
-                    kw["reply_to_message_id"] = int(msg_id)
-                    first = False
-                await bot.send_message(**kw)
+            await _send_chunked(bot, int(target), text, reply_to=int(msg_id))
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        elif verb == "REPLYHTML":
+            target, msg_id, text = _split(rest, 2)
+            try:
+                await _send_chunked(
+                    bot,
+                    int(target),
+                    _unescape_body(text),
+                    reply_to=int(msg_id),
+                    parse_mode=ParseMode.HTML,
+                )
+            except BadRequest as e:
+                if _is_markup_error(e):
+                    emit("MARKUP_ERROR", int(target), "-", _one_line(str(e)))
+                    return
+                raise
+        elif verb == "REPLYFILEHTML":
+            target, msg_id, path = _split(rest, 2)
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            try:
+                await _send_chunked(
+                    bot,
+                    int(target),
+                    text,
+                    reply_to=int(msg_id),
+                    parse_mode=ParseMode.HTML,
+                )
+            except BadRequest as e:
+                if _is_markup_error(e):
+                    emit("MARKUP_ERROR", int(target), path, _one_line(str(e)))
+                    return
+                raise
             try:
                 os.unlink(path)
             except OSError:
