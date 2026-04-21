@@ -1,0 +1,26 @@
+# Example systemd user unit for the claude-tgbot AUP/idle/turns watchdog.
+# Copy to the CONSUMER repo alongside the bot service, substitute values, install as:
+#   ln -s $CONSUMER/systemd/claude-<consumer>-aup-watchdog.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now claude-<consumer>-aup-watchdog.service
+
+[Unit]
+Description=<CONSUMER_NAME> claude-tgbot AUP / idle / turns watchdog
+Documentation=https://github.com/vjt/claude-tgbot
+After=default.target
+
+[Service]
+Type=simple
+# Consumer cwd used for: jsonl project-dir lookup, pane-cwd match, scrub_prompt.txt read.
+Environment=CLAUDE_TGBOT_CONSUMER_DIR=<CONSUMER_DIR>
+# Target tmux window (format: <session>:<window>) whose `claude` pane should receive /clear.
+# When the window has multiple `claude` panes, the watchdog picks the one whose cwd == CONSUMER_DIR.
+Environment=CLAUDE_TGBOT_TMUX_WINDOW=<TMUX_WINDOW>
+WorkingDirectory=<CONSUMER_DIR>
+ExecStart=/usr/bin/python3 -u /path/to/claude-tgbot/aup_watchdog.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:<CONSUMER_DIR>/aup_watchdog.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
