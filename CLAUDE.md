@@ -94,10 +94,18 @@ All triggers share one `DEBOUNCE_SEC` (30s) cooldown. Nothing here runs claude i
 
 **Config via env** (set by the systemd unit):
 
-- `CLAUDE_TGBOT_CONSUMER_DIR` — absolute consumer dir. Used to locate the jsonl project dir under `~/.claude/projects/<encoded-path>/`, to match the right tmux pane by `pane_current_path`, and to find the optional `scrub_prompt.txt`.
-- `CLAUDE_TGBOT_TMUX_WINDOW` — tmux target for `list-panes`, e.g. `0:myproject`.
+- `CLAUDE_TGBOT_CONSUMER_DIR` — absolute consumer dir. Used to locate the jsonl project dir under `~/.claude/projects/<encoded-path>/`, to match the right tmux pane (when possible) by `pane_current_path`, and to find the optional `scrub_prompt.txt`.
+- `CLAUDE_TGBOT_TMUX_WINDOW` — tmux target for `list-panes`, e.g. `0:myproject`. Backwards-compat only; resolution is session-agnostic now.
+- `CLAUDE_TGBOT_PROJECT_DIR` (optional) — explicit path to the CC project jsonl dir. Overrides the default `~/.claude/projects/<CONSUMER_DIR-with-/-and-.-replaced-by-->` derivation. Use when CC changes its encoding or the consumer runs under a non-default HOME.
+- `CLAUDE_TGBOT_ESCALATE_CHAT` (optional) — Telegram chat id for resolve-fail DMs via the consumer FIFO.
 
-**Pane disambiguation.** A tmux window can host multiple `claude` panes (consumer session + bridge-maintenance session). The watchdog picks the one whose `pane_current_command == claude` AND `pane_current_path == CLAUDE_TGBOT_CONSUMER_DIR`. Always match on both — matching on command alone will target whichever claude pane tmux lists first, which is usually the wrong one.
+**Pane disambiguation.** A tmux window can host multiple `claude` panes. Two-stage match, fast path first:
+1. `pane_current_command == "claude"` AND `pane_current_path == CONSUMER_DIR`. This is the canonical case — Linux + macOS set both correctly.
+2. Fallback: walk each pane's descendants via `pgrep -P` and grep every `ps -o command=` line for the literal "claude". Engages only when stage 1 returns zero matches. Catches hosts where tmux reports the interpreter (FreeBSD: `node`) instead of the argv[0] claude sets, and where `pane_current_path` is blank (FreeBSD again, no `/proc/<pid>/cwd` by default).
+
+Don't skip stage 1 — it's cheap and unambiguous on the majority of deploys. Don't drop stage 2 either — the empty-`pane_current_path` case is undetectable from tmux alone, and the fallback costs one `pgrep` + one `ps` per pane per resolve.
+
+**Encoding drift.** `~/.claude/projects/` encodes the cwd as a single segment; CC swaps `/` and `.` for `-`. The default derivation matches that. If CC ever changes the algorithm (it has before — at one point only `/` was replaced), consumers can pin their PROJECT_DIR via the env var instead of waiting on a bridge bump.
 
 **Post-clear scrub prompt.** If `<consumer>/scrub_prompt.txt` exists, its contents are pasted into the pane after each `/clear` (via `tmux load-buffer` + `paste-buffer` + separate Enter — sending text+Enter in one `send-keys` call races CC's Ink renderer and drops the text). Absent file = just clear, no rehydration. The elegant consumer idiom is `/start` — single-line file that re-runs the consumer's `/start` skill to bring the freshly-cleared session back online (log trim, bot check, Monitor reattach).
 

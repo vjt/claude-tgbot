@@ -16,6 +16,10 @@ Environment=CLAUDE_TGBOT_CONSUMER_DIR=<CONSUMER_DIR>
 # the watchdog can't resolve a claude pane for RESOLVE_ALERT_SEC (default 5 min).
 # Unset = silent (journal-only).
 #Environment=CLAUDE_TGBOT_ESCALATE_CHAT=<CHAT_ID>
+# Optional: pin the Claude Code per-project jsonl dir explicitly. Default derives
+# it from CONSUMER_DIR by replacing `/` and `.` with `-` under ~/.claude/projects/.
+# Override when CC's encoding changes or the consumer runs under a non-default HOME.
+#Environment=CLAUDE_TGBOT_PROJECT_DIR=/absolute/path/to/.claude/projects/-encoded-dir
 WorkingDirectory=<CONSUMER_DIR>
 ExecStart=/usr/bin/python3 -u /path/to/claude-tgbot/aup_watchdog.py
 Restart=on-failure

@@ -18,6 +18,11 @@ stack. Nothing here runs claude itself — it only kicks the pane.
 Config via env (set by the systemd unit):
 
     CLAUDE_TGBOT_CONSUMER_DIR   absolute consumer dir, e.g. /home/user/code/myproject
+    CLAUDE_TGBOT_PROJECT_DIR    (optional) explicit path to Claude Code's per-project
+                                jsonl dir. Defaults to the encoded form under
+                                ~/.claude/projects/. Override when CC's encoding
+                                algorithm changes, or when running in a non-default
+                                HOME layout.
     CLAUDE_TGBOT_TMUX_WINDOW    tmux target for list-panes, e.g. 0:myproject
     CLAUDE_TGBOT_ESCALATE_CHAT  (optional) Telegram chat_id to DM when pane
                                 resolution stays broken for RESOLVE_ALERT_SEC.
@@ -47,11 +52,20 @@ CONSUMER_DIR = Path(os.environ["CLAUDE_TGBOT_CONSUMER_DIR"]).resolve()
 TMUX_WINDOW = os.environ.get("CLAUDE_TGBOT_TMUX_WINDOW", "")
 ESCALATE_CHAT = os.environ.get("CLAUDE_TGBOT_ESCALATE_CHAT", "").strip()
 
-# ~/.claude/projects/ encodes the project cwd by replacing `/` with `-`.
-PROJECT_DIR = (
-    Path.home() / ".claude" / "projects"
-    / ("-" + str(CONSUMER_DIR).lstrip("/").replace("/", "-"))
-)
+# ~/.claude/projects/ encodes the project cwd as a single-segment name.
+# The encoding CC uses today swaps both `/` and `.` for `-` — a consumer
+# dir like /srv/www/nhaima.org lands at
+# ~/.claude/projects/-srv-www-nhaima-org/ (NOT -srv-www-nhaima.org).
+# Allow an explicit override via CLAUDE_TGBOT_PROJECT_DIR so we don't
+# re-break every time CC tweaks the algorithm.
+_project_override = os.environ.get("CLAUDE_TGBOT_PROJECT_DIR", "").strip()
+if _project_override:
+    PROJECT_DIR = Path(_project_override).expanduser()
+else:
+    PROJECT_DIR = (
+        Path.home() / ".claude" / "projects"
+        / ("-" + str(CONSUMER_DIR).lstrip("/").replace("/", "-").replace(".", "-"))
+    )
 
 SCRUB_PROMPT_FILE = CONSUMER_DIR / "scrub_prompt.txt"
 BOT_FIFO = CONSUMER_DIR / "bot.send"
@@ -127,44 +141,92 @@ def latest_jsonl() -> Path | None:
     return candidates[0] if candidates else None
 
 
-def resolve_claude_pane() -> str | None:
-    """Scan ALL tmux panes (session-agnostic) and pick the one whose
-    command is `claude` AND whose cwd resolves to CONSUMER_DIR.
+def _descendant_pids(pid: str) -> list[str]:
+    """Return pid and all its descendants via `pgrep -P`. Works on
+    Linux/macOS/FreeBSD; returns just [pid] if pgrep isn't available."""
+    out = [pid]
+    try:
+        kids = subprocess.check_output(["pgrep", "-P", pid], text=True).split()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return out
+    for k in kids:
+        out.extend(_descendant_pids(k))
+    return out
 
-    We used to target `-t TMUX_WINDOW` (e.g. `0:noema`), but tmux sessions
-    get renamed/recreated between reboots and the hard-coded numeric/named
-    session breaks silently — list-panes fails with "can't find session"
-    and the watchdog spams "skipping" without ever firing /clear. `-a`
-    makes resolution survive session churn; cwd match keeps it unique.
+
+def resolve_claude_pane() -> str | None:
+    """Scan ALL tmux panes (session-agnostic) and pick the one running a
+    claude session. Two strategies, tried in order:
+
+    1. Fast path — match `pane_current_command == "claude"` AND
+       `pane_current_path == CONSUMER_DIR`. This is what Linux + macOS
+       typically report: the claude binary sets its own argv[0] (so tmux
+       sees "claude" not "node"), and `pane_current_path` is populated
+       from /proc/<pid>/cwd.
+
+    2. Descendant walk — when the fast path returns zero matches (most
+       commonly on FreeBSD, where tmux reports `pane_current_command=node`
+       for node-launched CLIs and leaves `pane_current_path=""`), scan
+       each pane's process tree with `pgrep -P` and grep the full
+       `ps -o command=` output of every descendant for the literal
+       string "claude". If any descendant matches, claim that pane.
+
+    We used to target `-t TMUX_WINDOW`, but sessions get renamed/recreated
+    between reboots and hardcoded targets break silently. `-a` scans all
+    sessions; the cmd/descendant match keeps it unambiguous.
     """
     try:
         out = subprocess.check_output(
             ["tmux", "list-panes", "-a", "-F",
-             "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}"],
+             "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"],
             text=True,
         )
     except subprocess.CalledProcessError as e:
         log(f"tmux list-panes -a failed: {e}")
         return None
-    matches: list[str] = []
+
+    rows: list[tuple[str, str, str, str]] = []
     for line in out.splitlines():
         parts = line.rstrip("\n").split("\t")
-        if len(parts) != 3:
-            continue
-        pane_id, cmd, cwd = parts
+        if len(parts) == 4:
+            rows.append((parts[0], parts[1], parts[2], parts[3]))
+
+    # 1. Fast path: cmd=claude AND cwd=CONSUMER_DIR
+    fast_matches: list[str] = []
+    for pane_id, _pane_pid, cmd, cwd in rows:
         if cmd != "claude":
             continue
         try:
             if Path(cwd).resolve() == CONSUMER_DIR:
-                matches.append(pane_id)
+                fast_matches.append(pane_id)
         except OSError:
             continue
-    if not matches:
-        log(f"no pane with cmd=claude cwd={CONSUMER_DIR}")
-        return None
-    if len(matches) > 1:
-        log(f"multiple candidate panes {matches} — picking first")
-    return matches[0]
+    if fast_matches:
+        if len(fast_matches) > 1:
+            log(f"multiple candidate panes {fast_matches} — picking first")
+        return fast_matches[0]
+
+    # 2. Fallback: walk each pane's descendants, grep ps COMMAND for "claude"
+    slow_matches: list[str] = []
+    for pane_id, pane_pid, _cmd, _cwd in rows:
+        pids = _descendant_pids(pane_pid)
+        try:
+            ps_out = subprocess.check_output(
+                ["ps", "-o", "command=", "-p", ",".join(pids)],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        if any("claude" in ln.lower() for ln in ps_out.splitlines()):
+            slow_matches.append(pane_id)
+    if slow_matches:
+        if len(slow_matches) > 1:
+            log(f"multiple descendant-match panes {slow_matches} — picking first")
+        return slow_matches[0]
+
+    log(f"no pane matched — fast path (cmd=claude cwd={CONSUMER_DIR}) "
+        "nor descendant-walk found a claude process")
+    return None
 
 
 def inject_clear(pane: str) -> bool:

@@ -195,12 +195,16 @@ All triggers share one `DEBOUNCE_SEC` (30s) cooldown so back-to-back clears cann
 
 **Post-clear rehydration.** If `$CLAUDE_TGBOT_CONSUMER_DIR/scrub_prompt.txt` exists, its contents are pasted into the pane after each `/clear` (via `tmux load-buffer` + `paste-buffer` — `send-keys text Enter` in one call races Claude Code's Ink renderer and drops the text). A convenient idiom is a single-line file containing the name of a consumer skill that re-bootstraps the session, e.g. `/start`.
 
-**Pane resolution.** A tmux window can host multiple `claude` panes (consumer session + bridge-maintenance session). The watchdog matches on both `pane_current_command == claude` AND `pane_current_path == CLAUDE_TGBOT_CONSUMER_DIR` so the right pane gets kicked.
+**Pane resolution.** A tmux window can host multiple `claude` panes (consumer session + bridge-maintenance session). The watchdog picks the right one in two stages. Fast path: match `pane_current_command == "claude"` AND `pane_current_path == CLAUDE_TGBOT_CONSUMER_DIR` — works wherever claude registers its own argv[0] and tmux populates `pane_current_path` from `/proc/<pid>/cwd` (typical on Linux and macOS). Fallback: if the fast path finds nothing, scan each pane's process tree with `pgrep -P` and grep every descendant's `ps -o command=` for the literal "claude" — this catches FreeBSD, where tmux reports the interpreter (`node`) instead of the argv[0] and leaves `pane_current_path` empty. No knob; the fallback only engages when the fast path returns zero matches, so the Linux/macOS hot path stays unchanged.
+
+**Project-dir encoding.** Claude Code stores per-project jsonl under `~/.claude/projects/<encoded-cwd>/`. The current encoding swaps both `/` and `.` for `-` (so `/srv/www/nhaima.org` → `-srv-www-nhaima-org`). The watchdog applies that mapping by default; if CC changes the algorithm or you're in a non-default HOME, pin the path explicitly via `CLAUDE_TGBOT_PROJECT_DIR`.
 
 **Config via env** (set by the systemd unit):
 
 - `CLAUDE_TGBOT_CONSUMER_DIR` — absolute consumer dir.
-- `CLAUDE_TGBOT_TMUX_WINDOW` — tmux target for `list-panes`, e.g. `0:myproject`.
+- `CLAUDE_TGBOT_TMUX_WINDOW` — tmux target for `list-panes`, e.g. `0:myproject`. Kept for backwards compat; current resolution is session-agnostic via `list-panes -a`.
+- `CLAUDE_TGBOT_PROJECT_DIR` (optional) — explicit path to the CC project jsonl dir; bypasses the encoding derivation above.
+- `CLAUDE_TGBOT_ESCALATE_CHAT` (optional) — Telegram chat id to DM via the consumer FIFO when the watchdog can't resolve a claude pane for `RESOLVE_ALERT_SEC` (default 5 min). Unset = silent, journal-only.
 
 **Deploy.** Copy `systemd/aup-watchdog.service.example` into the consumer repo, fill in the two `Environment=` lines + paths, symlink into `~/.config/systemd/user/`, then:
 
