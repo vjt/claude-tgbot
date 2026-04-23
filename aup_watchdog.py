@@ -11,6 +11,9 @@ independent triggers:
 2. Turns — MAX_TURNS assistant turns since last clear → eager clear.
 3. Idle — jsonl mtime hasn't advanced for IDLE_SEC AND there is no
    pending assistant tool_use awaiting a user tool_result → clear.
+4. Manual — SIGUSR1 forces a /clear + scrub on the next tick, bypassing
+   debounce. For testing the scrub flow on demand:
+       systemctl --user kill -s SIGUSR1 claude-noema-aup-watchdog.service
 
 All triggers share one cooldown window so back-to-back clears never
 stack. Nothing here runs claude itself — it only kicks the pane.
@@ -40,6 +43,7 @@ Port of claude-ircbot's aup_watchdog.py, generalised for the tgbot bridge.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -75,7 +79,7 @@ DEBOUNCE_SEC = 30           # any clear — AUP / idle / turns — holds this wi
 IDLE_SEC = 600              # 10 min of no jsonl writes = idle
 MAX_TURNS = 100             # assistant turns since last clear → eager clear
 TAIL_SCAN = 200             # lines from end to check for pending tool_use
-POST_CLEAR_WAIT = 10        # seconds for /clear to settle before scrub prompt (Pi is slow)
+POST_CLEAR_WAIT = 3         # seconds for /clear to settle before scrub prompt (capture-verify + retries cover Ink race)
 SCRUB_VERIFY_TRIES = 4      # retries if paste didn't land in input
 SCRUB_VERIFY_GAP = 3        # seconds between verify retries
 RESOLVE_ALERT_SEC = 300     # consecutive resolve failures before Telegram escalation
@@ -367,6 +371,17 @@ def has_pending_tool_use(lines: list[str]) -> bool:
 
 _resolve_state: dict[str, float | bool] = {"fail_since": 0.0, "alerted": False}
 
+# Set by SIGUSR1 handler to force a /clear on the next main-loop tick.
+# Use case: manual test of the scrub flow without waiting for idle/turn-cap.
+#   systemctl --user kill -s SIGUSR1 claude-noema-aup-watchdog.service
+_manual_fire = False
+
+
+def _handle_sigusr1(_signum, _frame) -> None:
+    global _manual_fire
+    _manual_fire = True
+    _emit("SIGUSR1 received — will fire /clear + scrub on next tick")
+
 
 def fire_clear(reason: str) -> bool:
     pane = resolve_claude_pane()
@@ -406,6 +421,8 @@ def fire_clear(reason: str) -> bool:
 
 
 def main() -> int:
+    signal.signal(signal.SIGUSR1, _handle_sigusr1)
+
     if not PROJECT_DIR.exists():
         log(f"project dir missing (will appear on first claude session): {PROJECT_DIR}")
         # Don't exit — wait for it to appear.
@@ -450,6 +467,18 @@ def main() -> int:
 
             now = time.time()
             fired_this_tick = False
+
+            # --- Manual trigger: SIGUSR1 forces a /clear + scrub now ---
+            # Bypasses debounce and AUP/turns/idle logic — for testing the
+            # scrub flow on demand. `systemctl --user kill -s SIGUSR1 …`.
+            global _manual_fire
+            if _manual_fire:
+                _manual_fire = False
+                if fire_clear("MANUAL SIGUSR1"):
+                    last_fire = now
+                    turns_since_clear = 0
+                    fired_this_tick = True
+
             if chunk:
                 for line in chunk.splitlines():
                     if not line.strip():
