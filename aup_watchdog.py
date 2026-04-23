@@ -75,7 +75,9 @@ DEBOUNCE_SEC = 30           # any clear — AUP / idle / turns — holds this wi
 IDLE_SEC = 600              # 10 min of no jsonl writes = idle
 MAX_TURNS = 100             # assistant turns since last clear → eager clear
 TAIL_SCAN = 200             # lines from end to check for pending tool_use
-POST_CLEAR_WAIT = 3         # seconds for /clear to settle before scrub prompt
+POST_CLEAR_WAIT = 10        # seconds for /clear to settle before scrub prompt (Pi is slow)
+SCRUB_VERIFY_TRIES = 4      # retries if paste didn't land in input
+SCRUB_VERIFY_GAP = 3        # seconds between verify retries
 RESOLVE_ALERT_SEC = 300     # consecutive resolve failures before Telegram escalation
 LOG_DEDUP_SEC = 60          # collapse identical consecutive log lines for this long
 
@@ -240,36 +242,60 @@ def inject_clear(pane: str) -> bool:
         return False
 
 
-def inject_scrub(pane: str, prompt: str) -> bool:
-    """After /clear has settled, paste the consumer's scrub prompt.
+def _capture_pane(pane: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["tmux", "capture-pane", "-p", "-t", pane, "-S", "-40"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return ""
 
-    Delivered via paste-buffer (atomic) + separate Enter. `send-keys text
-    Enter` in one call sends chars+Enter back-to-back, which races CC's
-    Ink/React renderer mid-/clear — chars get dropped and only the Enter
-    registers, producing an empty submit. paste-buffer hands the whole
-    string to the pty in one syscall (bracketed paste), then Enter submits
-    after a small settle delay.
+
+def inject_scrub(pane: str, prompt: str) -> bool:
+    """After /clear settles, type the scrub prompt into CC's input and submit.
+
+    Previously used `tmux paste-buffer` + Enter — looked atomic but lost
+    chars: on the Pi, /clear's Ink/React rerender still ran past
+    POST_CLEAR_WAIT and swallowed the paste, so only the Enter registered
+    (empty submit). New approach:
+
+    1. Sleep POST_CLEAR_WAIT for /clear to settle.
+    2. Type the prompt with `send-keys -l` (literal chars, no key-name
+       interpretation) — one syscall per type.
+    3. Verify the chars actually showed up in the pane via capture-pane;
+       retry SCRUB_VERIFY_TRIES times if not.
+    4. Send Enter only after verification.
     """
     time.sleep(POST_CLEAR_WAIT)
-    buf_name = f"claude-tgbot-scrub-{os.getpid()}"
+    # First N chars we expect to find on-screen. Strip whitespace so literal
+    # leading/trailing newlines don't confuse the capture match.
+    needle = prompt.strip().splitlines()[0][:40]
+    landed = False
+    for attempt in range(1, SCRUB_VERIFY_TRIES + 1):
+        try:
+            subprocess.check_call(
+                ["tmux", "send-keys", "-t", pane, "-l", prompt]
+            )
+        except subprocess.CalledProcessError as e:
+            log(f"tmux send-keys -l (scrub) failed on {pane} attempt {attempt}: {e}")
+            time.sleep(SCRUB_VERIFY_GAP)
+            continue
+        time.sleep(SCRUB_VERIFY_GAP)
+        if needle and needle in _capture_pane(pane):
+            landed = True
+            break
+        log(f"scrub paste not yet visible on {pane} (attempt {attempt}/{SCRUB_VERIFY_TRIES})")
+    if not landed:
+        log(f"scrub paste never landed on {pane} after {SCRUB_VERIFY_TRIES} tries — giving up")
+        return False
     try:
-        # check_call doesn't accept `input=` (Popen has no such kwarg).
-        # Use subprocess.run for the one call that pipes stdin.
-        subprocess.run(
-            ["tmux", "load-buffer", "-b", buf_name, "-"],
-            input=prompt.encode(),
-            check=True,
-        )
-        subprocess.check_call(
-            ["tmux", "paste-buffer", "-b", buf_name, "-d", "-t", pane]
-        )
-        time.sleep(0.5)
         subprocess.check_call(
             ["tmux", "send-keys", "-t", pane, "Enter"]
         )
         return True
     except subprocess.CalledProcessError as e:
-        log(f"tmux paste-buffer/send-keys (scrub) failed on {pane}: {e}")
+        log(f"tmux send-keys Enter (scrub submit) failed on {pane}: {e}")
         return False
 
 
