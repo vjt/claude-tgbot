@@ -19,6 +19,10 @@ Config via env (set by the systemd unit):
 
     CLAUDE_TGBOT_CONSUMER_DIR   absolute consumer dir, e.g. /home/user/code/myproject
     CLAUDE_TGBOT_TMUX_WINDOW    tmux target for list-panes, e.g. 0:myproject
+    CLAUDE_TGBOT_ESCALATE_CHAT  (optional) Telegram chat_id to DM when pane
+                                resolution stays broken for RESOLVE_ALERT_SEC.
+                                Uses consumer's bot.send FIFO (SAY verb).
+                                Unset = silent (log-only).
 
 Optional per-consumer scrub: if `<consumer>/scrub_prompt.txt` exists,
 its contents get pasted into the pane after each `/clear` (so the
@@ -37,7 +41,11 @@ import time
 from pathlib import Path
 
 CONSUMER_DIR = Path(os.environ["CLAUDE_TGBOT_CONSUMER_DIR"]).resolve()
-TMUX_WINDOW = os.environ["CLAUDE_TGBOT_TMUX_WINDOW"]
+# TMUX_WINDOW kept for backwards compat / unit-file stability but NO LONGER
+# used for pane resolution — sessions get renamed/recreated, so we scan all
+# sessions via `list-panes -a` and pick by cmd=claude + cwd=CONSUMER_DIR.
+TMUX_WINDOW = os.environ.get("CLAUDE_TGBOT_TMUX_WINDOW", "")
+ESCALATE_CHAT = os.environ.get("CLAUDE_TGBOT_ESCALATE_CHAT", "").strip()
 
 # ~/.claude/projects/ encodes the project cwd by replacing `/` with `-`.
 PROJECT_DIR = (
@@ -46,6 +54,7 @@ PROJECT_DIR = (
 )
 
 SCRUB_PROMPT_FILE = CONSUMER_DIR / "scrub_prompt.txt"
+BOT_FIFO = CONSUMER_DIR / "bot.send"
 
 POLL_SEC = 2
 DEBOUNCE_SEC = 30           # any clear — AUP / idle / turns — holds this window
@@ -53,6 +62,8 @@ IDLE_SEC = 600              # 10 min of no jsonl writes = idle
 MAX_TURNS = 100             # assistant turns since last clear → eager clear
 TAIL_SCAN = 200             # lines from end to check for pending tool_use
 POST_CLEAR_WAIT = 3         # seconds for /clear to settle before scrub prompt
+RESOLVE_ALERT_SEC = 300     # consecutive resolve failures before Telegram escalation
+LOG_DEDUP_SEC = 60          # collapse identical consecutive log lines for this long
 
 STUCK_PATTERNS = re.compile(
     r"(unable to respond to this request|appears to violate our Usage Policy|Usage Policy)",
@@ -60,8 +71,40 @@ STUCK_PATTERNS = re.compile(
 )
 
 
-def log(msg: str) -> None:
+_log_state: dict[str, float | str | int] = {"last_msg": "", "last_ts": 0.0, "repeat": 0}
+
+
+def _emit(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def log(msg: str) -> None:
+    """Print with dedup: identical consecutive lines collapse for LOG_DEDUP_SEC,
+    then emit a '(repeated N times in X s)' summary on transition."""
+    now = time.time()
+    last_msg = _log_state["last_msg"]
+    last_ts = float(_log_state["last_ts"])
+    repeat = int(_log_state["repeat"])
+    if msg == last_msg and now - last_ts < LOG_DEDUP_SEC:
+        _log_state["repeat"] = repeat + 1
+        return
+    if repeat > 0 and isinstance(last_msg, str):
+        _emit(f"(last line repeated {repeat}x over {int(now - last_ts)}s)")
+    _emit(msg)
+    _log_state["last_msg"] = msg
+    _log_state["last_ts"] = now
+    _log_state["repeat"] = 0
+
+
+def send_fifo_say(chat_id: str, msg: str) -> None:
+    """Fire a SAY to the tgbot FIFO — best effort, never raises."""
+    if not chat_id:
+        return
+    try:
+        with BOT_FIFO.open("w") as f:
+            f.write(f"SAY {chat_id} {msg}\n")
+    except OSError as e:
+        _emit(f"FIFO write failed: {e!r}")
 
 
 def load_scrub_prompt() -> str | None:
@@ -85,19 +128,25 @@ def latest_jsonl() -> Path | None:
 
 
 def resolve_claude_pane() -> str | None:
-    """Pick the tmux pane in TMUX_WINDOW whose current command is `claude`
-    AND whose cwd is CONSUMER_DIR. A single tmux window can host multiple
-    `claude` panes (consumer + bridge-maintenance), so cwd disambiguates.
+    """Scan ALL tmux panes (session-agnostic) and pick the one whose
+    command is `claude` AND whose cwd resolves to CONSUMER_DIR.
+
+    We used to target `-t TMUX_WINDOW` (e.g. `0:noema`), but tmux sessions
+    get renamed/recreated between reboots and the hard-coded numeric/named
+    session breaks silently — list-panes fails with "can't find session"
+    and the watchdog spams "skipping" without ever firing /clear. `-a`
+    makes resolution survive session churn; cwd match keeps it unique.
     """
     try:
         out = subprocess.check_output(
-            ["tmux", "list-panes", "-t", TMUX_WINDOW,
-             "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}"],
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}"],
             text=True,
         )
     except subprocess.CalledProcessError as e:
-        log(f"tmux list-panes failed: {e}")
+        log(f"tmux list-panes -a failed: {e}")
         return None
+    matches: list[str] = []
     for line in out.splitlines():
         parts = line.rstrip("\n").split("\t")
         if len(parts) != 3:
@@ -107,10 +156,15 @@ def resolve_claude_pane() -> str | None:
             continue
         try:
             if Path(cwd).resolve() == CONSUMER_DIR:
-                return pane_id
+                matches.append(pane_id)
         except OSError:
             continue
-    return None
+    if not matches:
+        log(f"no pane with cmd=claude cwd={CONSUMER_DIR}")
+        return None
+    if len(matches) > 1:
+        log(f"multiple candidate panes {matches} — picking first")
+    return matches[0]
 
 
 def inject_clear(pane: str) -> bool:
@@ -223,11 +277,37 @@ def has_pending_tool_use(lines: list[str]) -> bool:
     return any(tid not in results for tid in used)
 
 
+_resolve_state: dict[str, float | bool] = {"fail_since": 0.0, "alerted": False}
+
+
 def fire_clear(reason: str) -> bool:
     pane = resolve_claude_pane()
+    now = time.time()
     if pane is None:
-        log(f"{reason} but no claude pane found in {TMUX_WINDOW} with cwd={CONSUMER_DIR} — skipping")
+        fail_since = float(_resolve_state["fail_since"])
+        if fail_since == 0.0:
+            _resolve_state["fail_since"] = now
+        elif (
+            not _resolve_state["alerted"]
+            and now - fail_since >= RESOLVE_ALERT_SEC
+        ):
+            msg = (
+                f"watchdog: can't find claude pane "
+                f"(cwd={CONSUMER_DIR}, cmd=claude) for "
+                f"{int(now - fail_since)}s — /clear injection stalled ({reason})"
+            )
+            log(f"ESCALATING to chat={ESCALATE_CHAT or '<unset>'}: {msg}")
+            send_fifo_say(ESCALATE_CHAT, msg)
+            _resolve_state["alerted"] = True
+        log(f"{reason} but no claude pane found with cwd={CONSUMER_DIR} — skipping")
         return False
+    if _resolve_state["alerted"]:
+        send_fifo_say(
+            ESCALATE_CHAT,
+            f"watchdog: pane resolved again ({pane}) — back to normal",
+        )
+    _resolve_state["fail_since"] = 0.0
+    _resolve_state["alerted"] = False
     log(f"{reason} → injecting /clear into {pane}")
     if not inject_clear(pane):
         return False
@@ -242,8 +322,8 @@ def main() -> int:
         log(f"project dir missing (will appear on first claude session): {PROJECT_DIR}")
         # Don't exit — wait for it to appear.
 
-    log(f"watchdog starting — consumer={CONSUMER_DIR} tmux={TMUX_WINDOW} "
-        f"project_dir={PROJECT_DIR} "
+    log(f"watchdog starting — consumer={CONSUMER_DIR} "
+        f"project_dir={PROJECT_DIR} escalate_chat={ESCALATE_CHAT or '<unset>'} "
         f"(IDLE_SEC={IDLE_SEC}, DEBOUNCE_SEC={DEBOUNCE_SEC}, MAX_TURNS={MAX_TURNS})")
     boot_ts = time.time()
     current_file: Path | None = None
@@ -310,6 +390,10 @@ def main() -> int:
                     fired_this_tick = True
 
             # --- Idle trigger: jsonl quiet + no pending tool_use ---
+            # `mtime > last_fire` gates on evidence that CC actually processed
+            # the previous /clear (wrote at least one line after it). Without
+            # this, a stuck pane never advances mtime → age stays huge → every
+            # DEBOUNCE_SEC fires another /clear → clears pile up in CC's input.
             if not fired_this_tick:
                 age = now - current_file.stat().st_mtime
                 boot_age = now - boot_ts
@@ -317,6 +401,7 @@ def main() -> int:
                     age >= IDLE_SEC
                     and boot_age >= IDLE_SEC
                     and now - last_fire >= DEBOUNCE_SEC
+                    and current_file.stat().st_mtime > last_fire
                 ):
                     if has_pending_tool_use(tail_lines(current_file)):
                         log(f"idle {int(age)}s but pending tool_use — skipping")
