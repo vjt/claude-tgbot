@@ -163,6 +163,10 @@ Skill(skill-name)               # exact skill name
 Tool(key:value)                 # generic key:value equality on tool_input
 ```
 
+**Bootstrap trap — the chicken-and-egg:** the agent receives operator approvals as regular Telegram messages, which only land once the session's `Monitor` is already tailing `bot.stdout.log`. But attaching the Monitor is itself a tool call, and so are the commands the bootstrap skill runs before it (reading `.env`, checking `bot.pid`, writing to `bot.send`). If those aren't in the allow-list, the hook denies them on first run, DMs the admin, then blocks waiting for an ack that can't arrive — because the thing that would deliver the ack is the tool call you just blocked.
+
+Rule of thumb: every tool the consumer's bootstrap skill uses must resolve to an allow entry without operator intervention. The safe baseline is bare names for `Monitor`, `Bash`, `Skill`, and any Task tools the skill touches, plus `Read` and scoped `Write`/`Edit` globs for the consumer dir. Tighten after the session is up — e.g. narrow `Bash` to a command-glob set once the operator has seen the typical traffic. Keep `WebFetch` / `WebSearch` off the bare-name list so network reach stays gated.
+
 ## systemd
 
 Each consumer ships its own unit (one bot instance per consumer). `systemd/consumer.service.example` in this repo is a template — copy into the consumer's repo, substitute paths + `CLAUDE_TGBOT_CONSUMER_DIR`, then install:
