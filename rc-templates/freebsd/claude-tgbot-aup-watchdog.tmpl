@@ -1,0 +1,34 @@
+#!/bin/sh
+# PROVIDE: claude_tgbot_aup_watchdog
+# REQUIRE: claude_tgbot_bot
+# KEYWORD: shutdown
+#
+# claude-tgbot AUP / idle / turns watchdog for consumer @CONSUMER@.
+# Rendered by $PLUGIN/bin/install-freebsd.sh; do not edit in place.
+#
+# /etc/rc.conf:
+#   claude_tgbot_aup_watchdog_enable="YES"
+
+. /etc/rc.subr
+
+name="claude_tgbot_aup_watchdog"
+rcvar="claude_tgbot_aup_watchdog_enable"
+
+load_rc_config "$name"
+
+: ${claude_tgbot_aup_watchdog_enable:=NO}
+: ${claude_tgbot_aup_watchdog_user:=@USER@}
+: ${claude_tgbot_aup_watchdog_dir:=@CONSUMER@}
+: ${claude_tgbot_aup_watchdog_script:=@PLUGIN@/aup_watchdog.py}
+
+pidfile="${claude_tgbot_aup_watchdog_dir}/aup_watchdog.pid"
+logfile="${claude_tgbot_aup_watchdog_dir}/aup_watchdog.log"
+
+# Explicit PATH: rc-spawned services don't inherit the interactive login PATH,
+# so subprocess calls to tmux (/usr/local/bin/tmux on BSD), pgrep, ps must have
+# their binaries findable. Without this the watchdog crashes on first trigger
+# with FileNotFoundError(2, 'No such file or directory') → 'tmux' and loops.
+command="/usr/sbin/daemon"
+command_args="-f -r -R 5 -P ${pidfile} -o ${logfile} -- env HOME=${claude_tgbot_aup_watchdog_dir} PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CLAUDE_TGBOT_CONSUMER_DIR=${claude_tgbot_aup_watchdog_dir} /usr/local/bin/python3 -u ${claude_tgbot_aup_watchdog_script}"
+
+run_rc_command "$1"

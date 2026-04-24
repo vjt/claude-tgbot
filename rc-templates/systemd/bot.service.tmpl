@@ -1,0 +1,20 @@
+[Unit]
+Description=claude-tgbot Telegram bridge (consumer: @CONSUMER@)
+Documentation=https://github.com/vjt/claude-tgbot
+After=network-online.target default.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CLAUDE_TGBOT_CONSUMER_DIR=@CONSUMER@
+WorkingDirectory=@CONSUMER@
+ExecStart=@VENV@/bin/python -u @PLUGIN@/bot.py
+Restart=always
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+StandardOutput=append:@CONSUMER@/bot.stdout.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,35 @@
+#!/bin/sh
+# PROVIDE: claude_tgbot_bot
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# claude-tgbot Telegram bridge for consumer @CONSUMER@.
+# Rendered by $PLUGIN/bin/install-freebsd.sh; do not edit in place.
+#
+# /etc/rc.conf:
+#   claude_tgbot_bot_enable="YES"
+
+. /etc/rc.subr
+
+name="claude_tgbot_bot"
+rcvar="claude_tgbot_bot_enable"
+
+load_rc_config "$name"
+
+: ${claude_tgbot_bot_enable:=NO}
+: ${claude_tgbot_bot_user:=@USER@}
+: ${claude_tgbot_bot_dir:=@CONSUMER@}
+: ${claude_tgbot_bot_venv:=@VENV@}
+: ${claude_tgbot_bot_script:=@PLUGIN@/bot.py}
+
+pidfile="${claude_tgbot_bot_dir}/bot.pid"
+logfile="${claude_tgbot_bot_dir}/bot.stdout.log"
+
+# rc.subr wraps us with `limits -C daemon su -m ${user} -c ...` which already
+# drops privileges. Don't pass `-u` to daemon(8) a second time — it would try
+# setusercontext() from an already-non-root uid and emit a "failed to set user
+# environment" tight respawn loop.
+command="/usr/sbin/daemon"
+command_args="-f -r -R 30 -P ${pidfile} -o ${logfile} -- env HOME=${claude_tgbot_bot_dir} PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin CLAUDE_TGBOT_CONSUMER_DIR=${claude_tgbot_bot_dir} ${claude_tgbot_bot_venv}/bin/python -u ${claude_tgbot_bot_script}"
+
+run_rc_command "$1"

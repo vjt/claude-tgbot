@@ -1,0 +1,19 @@
+[Unit]
+Description=claude-tgbot AUP / idle / turns watchdog (consumer: @CONSUMER@)
+Documentation=https://github.com/vjt/claude-tgbot
+After=default.target
+
+[Service]
+Type=simple
+Environment=CLAUDE_TGBOT_CONSUMER_DIR=@CONSUMER@
+# tmux lives in /usr/local/bin on BSD-shaped systems; make sure subprocess
+# lookups (tmux, pgrep, ps) find their binaries regardless of the login PATH
+# the user-scoped unit inherits.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=@CONSUMER@
+ExecStart=/usr/bin/python3 -u @PLUGIN@/aup_watchdog.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
