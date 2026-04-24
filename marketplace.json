@@ -1,0 +1,12 @@
+{
+  "plugins": [
+    {
+      "name": "claude-tgbot",
+      "description": "Interactive installer + rolling-memory seed for a Telegram-driven Claude Code session.",
+      "source": {
+        "source": "github",
+        "repo": "vjt/claude-tgbot"
+      }
+    }
+  ]
+}

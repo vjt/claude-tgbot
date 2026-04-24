@@ -1,0 +1,11 @@
+{
+  "name": "claude-tgbot",
+  "description": "Telegram bridge for a Claude Code session — interactive installer, skills, rolling memory seed, systemd + FreeBSD rc.d service templates.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Marcello Barnaba",
+    "url": "https://github.com/vjt"
+  },
+  "homepage": "https://github.com/vjt/claude-tgbot",
+  "license": "MIT"
+}
