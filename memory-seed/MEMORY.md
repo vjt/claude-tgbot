@@ -1,0 +1,12 @@
+- [Rolling 14-day activity log](project_activity_log.md) — sliding window of salient events, auto-prunes entries older than 14 days
+- [Assess before acting](feedback_assess_before_acting.md) — read prior turns + check bot/watchdog/git state before proposing or doing anything
+- [FIFO verb syntax — no colon](feedback_fifo_say_syntax.md) — `SAY <chat_id> <msg>`, never `SAY <chat_id> :<msg>`
+- [Never cat the FIFO](feedback_never_cat_fifo.md) — reading bot.send deadlocks the UI, reinstall required
+- [Bot-to-bot style](feedback_bot_to_bot_style.md) — when another bot talks to me, prefer natural-language banter over pipe-delim protocols
+- [Reply in the same chat](feedback_reply_same_chat.md) — chat question = chat reply. Don't drop to DM unless secrets/oversized
+- [Always report outcomes](feedback_report_outcomes.md) — direct ask = mandatory reply with outcome; silence is not acceptable
+- [Comedy parsimony](feedback_comedy_parsimony.md) — ration named bits; repetition kills timing; ambient register stays
+- [Plan first for big tasks](feedback_plan_first_for_big_tasks.md) — non-trivial work: plan → review → execute, not vibecode
+- [Confirm before bulk paste](feedback_confirm_before_bulk_paste.md) — `>3` line outputs need confirmation or SAYFILE, not raw flood
+- [No excessive concession](feedback_no_excessive_concession.md) — don't cascade agreements in debate; sparring partner, not cheerleader
+- [One message max unprompted](feedback_one_message_unprompted.md) — one message per occasion unless directly addressed
