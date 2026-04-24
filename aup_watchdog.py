@@ -383,9 +383,39 @@ def _handle_sigusr1(_signum, _frame) -> None:
     _emit("SIGUSR1 received — will fire /clear + scrub on next tick")
 
 
-def fire_clear(reason: str) -> bool:
-    pane = resolve_claude_pane()
+def fire_clear(
+    reason: str,
+    *,
+    current_file: Path | None = None,
+    last_fire: float = 0.0,
+    force: bool = False,
+) -> bool:
+    """Inject /clear + scrub into the claude pane.
+
+    Guard against re-clearing a wedged session: if jsonl mtime has NOT advanced
+    past the previous fire_clear, the prior /clear likely never reached CC (pane
+    race, paste dropped, session dead) — firing again just stacks input nobody
+    consumes. Skip unless `force=True` (SIGUSR1 bypasses the guard intentionally,
+    so an operator can retry without waiting for a spurious advance).
+    """
     now = time.time()
+    if (
+        not force
+        and current_file is not None
+        and last_fire > 0.0
+    ):
+        try:
+            mtime = current_file.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if mtime <= last_fire:
+            log(
+                f"{reason} but jsonl idle since last fire "
+                f"({int(now - last_fire)}s ago, mtime unchanged) — "
+                "session appears wedged, skipping re-clear"
+            )
+            return False
+    pane = resolve_claude_pane()
     if pane is None:
         fail_since = float(_resolve_state["fail_since"])
         if fail_since == 0.0:
@@ -474,7 +504,7 @@ def main() -> int:
             global _manual_fire
             if _manual_fire:
                 _manual_fire = False
-                if fire_clear("MANUAL SIGUSR1"):
+                if fire_clear("MANUAL SIGUSR1", force=True):
                     last_fire = now
                     turns_since_clear = 0
                     fired_this_tick = True
@@ -489,7 +519,11 @@ def main() -> int:
                         if now - last_fire < DEBOUNCE_SEC:
                             log("AUP match (debounced, skipping)")
                             break
-                        if fire_clear("AUP STUCK DETECTED"):
+                        if fire_clear(
+                            "AUP STUCK DETECTED",
+                            current_file=current_file,
+                            last_fire=last_fire,
+                        ):
                             last_fire = now
                             turns_since_clear = 0
                             fired_this_tick = True
@@ -501,7 +535,11 @@ def main() -> int:
                     pass  # wait out debounce, fire next tick
                 elif has_pending_tool_use(tail_lines(current_file)):
                     log(f"turns {turns_since_clear} but pending tool_use — skipping")
-                elif fire_clear(f"TURNS {turns_since_clear}"):
+                elif fire_clear(
+                    f"TURNS {turns_since_clear}",
+                    current_file=current_file,
+                    last_fire=last_fire,
+                ):
                     last_fire = now
                     turns_since_clear = 0
                     fired_this_tick = True
@@ -522,7 +560,11 @@ def main() -> int:
                 ):
                     if has_pending_tool_use(tail_lines(current_file)):
                         log(f"idle {int(age)}s but pending tool_use — skipping")
-                    elif fire_clear(f"IDLE {int(age)}s"):
+                    elif fire_clear(
+                        f"IDLE {int(age)}s",
+                        current_file=current_file,
+                        last_fire=last_fire,
+                    ):
                         last_fire = now
                         turns_since_clear = 0
 
