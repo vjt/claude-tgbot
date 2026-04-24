@@ -20,21 +20,42 @@ Not a one-click deploy. This is infrastructure — run it yourself on a host you
 
 About 350 lines of Python for the bot, plus ~300 more for the optional watchdog. Single external dependency: `python-telegram-bot`.
 
-## Running it
+## Install
 
-### Prerequisites
+### Option A — Claude Code plugin (recommended)
 
-1. A bot token from [@BotFather](https://t.me/BotFather).
-2. The numeric `user_id` of every allowed user and the numeric `chat_id` of the target chat (DM or group). Recipe: start the bot with an empty allowlist, DM it `/start`, read the reply — it prints both ids.
+This repo doubles as a Claude Code plugin. Installing it inside a `claude` session running inside `tmux`, at the cwd you want to drive, runs an interactive two-phase setup that handles the BotFather walkthrough, token entry, venv + deps, service-unit install (systemd or FreeBSD rc.d), permission hook wiring, skills, and a generic memory seed:
 
-### Install (bridge code, once per host)
-
-```bash
-python3 -m venv ~/code/.venv-tgbot
-~/code/.venv-tgbot/bin/pip install 'python-telegram-bot>=21'
+```
+/plugin marketplace add vjt/claude-tgbot
+/plugin install claude-tgbot@vjt/claude-tgbot
+/tgbot-install
 ```
 
-### Wire up a consumer
+- Phase A prompts for the bot token, renders a token-only `.env`, and starts the bot so you can DM `/start` to it and read back your `user_id` / `chat_id`.
+- Phase B collects those ids, finalizes `.env`, installs the watchdog + permission hook + skills, and seeds per-project memory under `~/.claude/projects/<encoded-cwd>/memory/`.
+
+See `commands/tgbot-install.md` for the exact flow. `/tgbot-update` pulls the plugin and restarts services in place; `/tgbot-uninstall` tears down, preserving `.env` and memory by default.
+
+Hard prereq the installer verifies up-front: the Claude Code session must be running inside `tmux`. The watchdog resolves the `claude` pane by scanning tmux — no tmux session, no watchdog.
+
+### Option B — manual (advanced)
+
+Skip the plugin and wire the pieces by hand when you want direct control or the plugin doesn't fit your environment.
+
+**Prerequisites**
+
+1. A bot token from [@BotFather](https://t.me/BotFather). Send `/setprivacy` → `Disable` so the bot sees non-mention messages in groups.
+2. The numeric `user_id` of every allowed user and the numeric `chat_id` of the target chat (DM or group). Recipe: start the bot with an empty allowlist, DM it `/start`, read the reply — it prints both ids.
+
+**Install (bridge code, once per host)**
+
+```bash
+python3 -m venv ~/.venv-tgbot
+~/.venv-tgbot/bin/pip install -r ~/code/claude-tgbot/requirements.txt
+```
+
+**Wire up a consumer**
 
 Everything else lives in the consumer repo (e.g. `~/code/myproject/`):
 
@@ -167,19 +188,30 @@ Tool(key:value)                 # generic key:value equality on tool_input
 
 Rule of thumb: every tool the consumer's bootstrap skill uses must resolve to an allow entry without operator intervention. The safe baseline is bare names for `Monitor`, `Bash`, `Skill`, `ToolSearch` (Claude Code lazy-loads deferred tool schemas through it — hitting the hook before the actual tool runs), and any Task tools the skill touches, plus `Read` and scoped `Write`/`Edit` globs for the consumer dir. Tighten after the session is up — e.g. narrow `Bash` to a command-glob set once the operator has seen the typical traffic. Keep `WebFetch` / `WebSearch` off the bare-name list so network reach stays gated.
 
-## systemd
+## Service units (systemd / FreeBSD rc.d)
 
-Each consumer ships its own unit (one bot instance per consumer). `systemd/consumer.service.example` in this repo is a template — copy into the consumer's repo, substitute paths + `CLAUDE_TGBOT_CONSUMER_DIR`, then install:
+The plugin installer (`/tgbot-install` — Option A above) renders and installs per-consumer unit files from `rc-templates/` via `bin/install-systemd.sh` (Linux) or `bin/install-freebsd.sh` (FreeBSD), handling `@PLACEHOLDER@` substitution for `CONSUMER`, `PLUGIN`, `VENV`, `USER`.
+
+Manual (Option B): copy the appropriate template, substitute the placeholders, and install system-wide.
+
+**systemd:**
 
 ```bash
-mkdir -p ~/.config/systemd/user
-ln -s ~/code/<consumer>/systemd/claude-<name>-bot.service ~/.config/systemd/user/
+sed -e "s|@CONSUMER@|~/code/<consumer>|g" \
+    -e "s|@PLUGIN@|~/code/claude-tgbot|g" \
+    -e "s|@VENV@|~/.venv-tgbot|g" \
+    -e "s|@USER@|$USER|g" \
+    ~/code/claude-tgbot/rc-templates/systemd/bot.service.tmpl \
+    > ~/.config/systemd/user/claude-tgbot-bot.service
+
 systemctl --user daemon-reload
-systemctl --user enable --now claude-<name>-bot.service
-journalctl --user -u claude-<name>-bot.service -f
+systemctl --user enable --now claude-tgbot-bot.service
+journalctl --user -u claude-tgbot-bot.service -f
 ```
 
-`loginctl enable-linger <user>` if you want it up when no one's logged in.
+`loginctl enable-linger <user>` if you want the service up when no one's logged in.
+
+**FreeBSD rc.d:** render `rc-templates/freebsd/claude-tgbot-bot.tmpl` (or the watchdog variant) into `/usr/local/etc/rc.d/claude-tgbot-bot` as root, then `sysrc claude_tgbot_bot_enable=YES && service claude-tgbot-bot start`. The templates bake in an explicit `PATH` so subprocess lookups for `tmux`, `pgrep`, `ps` find `/usr/local/bin/*` regardless of the minimal env rc inherits.
 
 Running two consumers side-by-side on the same host? Give each its own unit name (e.g. `claude-foo-bot.service`, `claude-bar-bot.service`), its own `.env` in its own consumer dir, its own bot token — one bridge checkout can drive both.
 
@@ -206,12 +238,12 @@ All triggers share one `DEBOUNCE_SEC` (30s) cooldown so back-to-back clears cann
 - `CLAUDE_TGBOT_PROJECT_DIR` (optional) — explicit path to the CC project jsonl dir; bypasses the encoding derivation above.
 - `CLAUDE_TGBOT_ESCALATE_CHAT` (optional) — Telegram chat id to DM via the consumer FIFO when the watchdog can't resolve a claude pane for `RESOLVE_ALERT_SEC` (default 5 min). Unset = silent, journal-only.
 
-**Deploy.** Copy `systemd/aup-watchdog.service.example` into the consumer repo, fill in the two `Environment=` lines + paths, symlink into `~/.config/systemd/user/`, then:
+**Deploy.** The plugin installer wires the watchdog alongside the bot (phase B of `/tgbot-install`). Manual route: render `rc-templates/systemd/aup-watchdog.service.tmpl` with the same `@PLACEHOLDER@` substitutions as the bot unit above, then:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now claude-<name>-aup-watchdog.service
-journalctl --user -u claude-<name>-aup-watchdog.service -f
+systemctl --user enable --now claude-tgbot-aup-watchdog.service
+journalctl --user -u claude-tgbot-aup-watchdog.service -f
 ```
 
 Watchdog output also lands in `$CLAUDE_TGBOT_CONSUMER_DIR/aup_watchdog.log` (the systemd unit appends there). Tune `MAX_TURNS` / `IDLE_SEC` / `DEBOUNCE_SEC` by editing the constants at the top of `aup_watchdog.py` — they're file-level on purpose. Add env knobs only when a second consumer actually needs different cadence.
