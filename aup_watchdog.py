@@ -78,6 +78,11 @@ POLL_SEC = 2
 DEBOUNCE_SEC = 30           # any clear — AUP / idle / turns — holds this window
 IDLE_SEC = 600              # 10 min of no jsonl writes = idle
 MAX_TURNS = 100             # assistant turns since last clear → eager clear
+IDLE_MIN_TURNS = 30         # skip IDLE fire unless this many assistant turns accumulated
+                            # since last clear — post-scrub /start bootstrap alone
+                            # produces ~10-20 turns; firing IDLE off a mere
+                            # post-bootstrap lull cycles /clear forever on sessions
+                            # that are just waiting for their next TG message.
 TAIL_SCAN = 200             # lines from end to check for pending tool_use
 POST_CLEAR_WAIT = 3         # seconds for /clear to settle before scrub prompt (capture-verify + retries cover Ink race)
 SCRUB_VERIFY_TRIES = 4      # retries if paste didn't land in input
@@ -311,45 +316,6 @@ def line_is_assistant_turn(line: str) -> bool:
     return rec.get("type") == "assistant"
 
 
-def line_is_real_user_msg(line: str, scrub: str | None) -> bool:
-    """True if the line is a genuine user-typed message (not a scrub echo,
-    not a tool_result). Used to gate re-fires on actual user activity.
-
-    Claude Code's jsonl marks both human messages and auto-injected
-    tool_result payloads as `type=user`. We want only the first kind —
-    and even then, skip the first user message after a /clear when it
-    matches the scrub prompt verbatim (that's the watchdog's own paste,
-    not a new human turn).
-    """
-    try:
-        rec = json.loads(line)
-    except json.JSONDecodeError:
-        return False
-    if rec.get("type") != "user":
-        return False
-    msg = rec.get("message", {})
-    if not isinstance(msg, dict):
-        return False
-    content = msg.get("content", "")
-    # content can be a bare string or a list of content blocks
-    if isinstance(content, list):
-        texts: list[str] = []
-        for b in content:
-            if isinstance(b, dict) and b.get("type") == "text":
-                t = b.get("text", "")
-                if isinstance(t, str):
-                    texts.append(t)
-        content = "".join(texts)
-    if not isinstance(content, str):
-        return False
-    text = content.strip()
-    if not text:
-        return False  # tool_result lines collapse to empty, ignore
-    if scrub and text == scrub.strip():
-        return False  # the watchdog's own scrub paste, not a human
-    return True
-
-
 def line_matches_aup(line: str) -> bool:
     try:
         rec = json.loads(line)
@@ -425,33 +391,12 @@ def _handle_sigusr1(_signum, _frame) -> None:
 def fire_clear(
     reason: str,
     *,
-    user_activity: bool = True,
-    last_fire: float = 0.0,
     force: bool = False,
 ) -> bool:
-    """Inject /clear + scrub into the claude pane.
-
-    Guard against re-clearing a session that had no real user activity since
-    the previous fire — checking jsonl mtime isn't enough, because a /clear
-    always produces post-scrub activity (Claude replying to the scrub, running
-    a bootstrap skill, etc.) that bumps mtime without any human having typed.
-    If `user_activity` is False (no non-scrub `type=user` message observed
-    since last_fire), the session is either wedged or simply sitting idle
-    waiting for input — either way, another /clear would just churn scrub
-    prompts against an empty room. Skip unless `force=True` (SIGUSR1 bypasses
-    the guard so an operator can retry on demand).
-    """
-    now = time.time()
-    if (
-        not force
-        and last_fire > 0.0
-        and not user_activity
-    ):
-        log(
-            f"{reason} but no user message since last fire "
-            f"({int(now - last_fire)}s ago) — idle session, skipping re-clear"
-        )
-        return False
+    """Inject /clear + scrub into the claude pane. Callers gate on their own
+    trigger conditions (AUP / TURNS / IDLE / SIGUSR1); this function is the
+    bare mechanism. `force=True` is reserved for SIGUSR1 (currently only
+    semantic, kept as an explicit operator-intent signal)."""
     pane = resolve_claude_pane()
     if pane is None:
         fail_since = float(_resolve_state["fail_since"])
@@ -498,18 +443,11 @@ def main() -> int:
         f"project_dir={PROJECT_DIR} escalate_chat={ESCALATE_CHAT or '<unset>'} "
         f"(IDLE_SEC={IDLE_SEC}, DEBOUNCE_SEC={DEBOUNCE_SEC}, MAX_TURNS={MAX_TURNS})")
     boot_ts = time.time()
-    scrub_text = load_scrub_prompt()
     current_file: Path | None = None
     current_pos = 0
     last_fire = 0.0
     first_attach = True
     turns_since_clear = 0
-    # True once a non-scrub `type=user` line appears in jsonl after the last
-    # fire_clear. Guards re-fires: if still False when a trigger condition
-    # would fire, the session is just idle waiting for the human, not wedged —
-    # don't clear it again. Starts True so the very first fire (no prior
-    # last_fire) is never blocked.
-    user_activity_since_fire = True
 
     while True:
         try:
@@ -551,7 +489,6 @@ def main() -> int:
                 if fire_clear("MANUAL SIGUSR1", force=True):
                     last_fire = now
                     turns_since_clear = 0
-                    user_activity_since_fire = False
                     fired_this_tick = True
 
             if chunk:
@@ -560,20 +497,13 @@ def main() -> int:
                         continue
                     if line_is_assistant_turn(line):
                         turns_since_clear += 1
-                    if line_is_real_user_msg(line, scrub_text):
-                        user_activity_since_fire = True
                     if line_matches_aup(line):
                         if now - last_fire < DEBOUNCE_SEC:
                             log("AUP match (debounced, skipping)")
                             break
-                        if fire_clear(
-                            "AUP STUCK DETECTED",
-                            user_activity=user_activity_since_fire,
-                            last_fire=last_fire,
-                        ):
+                        if fire_clear("AUP STUCK DETECTED"):
                             last_fire = now
                             turns_since_clear = 0
-                            user_activity_since_fire = False
                             fired_this_tick = True
                         break
 
@@ -583,20 +513,17 @@ def main() -> int:
                     pass  # wait out debounce, fire next tick
                 elif has_pending_tool_use(tail_lines(current_file)):
                     log(f"turns {turns_since_clear} but pending tool_use — skipping")
-                elif fire_clear(
-                    f"TURNS {turns_since_clear}",
-                    user_activity=user_activity_since_fire,
-                    last_fire=last_fire,
-                ):
+                elif fire_clear(f"TURNS {turns_since_clear}"):
                     last_fire = now
                     turns_since_clear = 0
-                    user_activity_since_fire = False
                     fired_this_tick = True
 
             # --- Idle trigger: jsonl quiet + no pending tool_use ---
-            # fire_clear's own user_activity guard handles the "session idle
-            # but healthy" case; here we just gate on the plain idle-age +
-            # debounce condition.
+            # Gated on IDLE_MIN_TURNS so a post-scrub /start bootstrap lull
+            # doesn't keep cycling /clear on sessions that are legitimately
+            # waiting for their next user (TG / IRC / CLI) message. The
+            # bootstrap skill alone produces ~10-20 assistant turns; demand
+            # real ongoing work before IDLE is allowed to fire.
             if not fired_this_tick:
                 age = now - current_file.stat().st_mtime
                 boot_age = now - boot_ts
@@ -604,17 +531,13 @@ def main() -> int:
                     age >= IDLE_SEC
                     and boot_age >= IDLE_SEC
                     and now - last_fire >= DEBOUNCE_SEC
+                    and turns_since_clear >= IDLE_MIN_TURNS
                 ):
                     if has_pending_tool_use(tail_lines(current_file)):
                         log(f"idle {int(age)}s but pending tool_use — skipping")
-                    elif fire_clear(
-                        f"IDLE {int(age)}s",
-                        user_activity=user_activity_since_fire,
-                        last_fire=last_fire,
-                    ):
+                    elif fire_clear(f"IDLE {int(age)}s"):
                         last_fire = now
                         turns_since_clear = 0
-                        user_activity_since_fire = False
 
             time.sleep(POLL_SEC)
         except KeyboardInterrupt:
