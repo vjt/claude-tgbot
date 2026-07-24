@@ -156,9 +156,22 @@ def _role_of(user_id: int) -> str:
     return "none"
 
 
+EMIT_PART_MAX = 500
+
+
+def _cap(part: object) -> str:
+    """Bound one event field. Exceptions can carry their payload: repr() of a
+    UnicodeDecodeError embeds the whole buffer it choked on, so a *FILE verb
+    pointed at a PNG once wrote a single 23 MB log line."""
+    s = str(part)
+    if len(s) <= EMIT_PART_MAX:
+        return s
+    return f"{s[:EMIT_PART_MAX]}…[+{len(s) - EMIT_PART_MAX} chars]"
+
+
 def emit(kind: str, *parts: object) -> None:
     """Single-line structured event to stdout (consumed by Monitor)."""
-    print(kind + (" " + " ".join(str(p) for p in parts) if parts else ""), flush=True)
+    print(kind + (" " + " ".join(_cap(p) for p in parts) if parts else ""), flush=True)
 
 
 def log(direction: str, line: str) -> None:
@@ -681,6 +694,9 @@ def main() -> int:
         stream=sys.stderr,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # httpx logs one INFO line per getUpdates poll (every ~10s) — pure noise that
+    # buried the event log under hundreds of MB. Only surface real HTTP failures.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     INBOX.mkdir(exist_ok=True)
     app = (
         ApplicationBuilder()
