@@ -77,8 +77,8 @@ BOT_FIFO = CONSUMER_DIR / "bot.send"
 POLL_SEC = 2
 DEBOUNCE_SEC = 60           # any clear — AUP / idle / turns — holds this window
                             # (must be ≥ PRE_CLEAR_WARN_SEC + POST_CLEAR_WAIT + buffer)
-IDLE_SEC = 600              # 10 min of no jsonl writes = idle
-MAX_TURNS = 100             # assistant turns since last clear → eager clear
+IDLE_SEC = 1200             # 20 min of no jsonl writes = idle
+MAX_TURNS = 200             # assistant turns since last clear → eager clear
 IDLE_MIN_TURNS = 30         # skip IDLE fire unless this many assistant turns accumulated
                             # since last clear — post-scrub /start bootstrap alone
                             # produces ~10-20 turns; firing IDLE off a mere
