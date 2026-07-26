@@ -156,7 +156,9 @@ def _role_of(user_id: int) -> str:
     return "none"
 
 
-EMIT_PART_MAX = 500
+# Telegram caps a text message at 4096 chars, so this bound never truncates a
+# real inbound MSG — it only clips runaway fields (see _cap).
+EMIT_PART_MAX = 4200
 
 
 def _cap(part: object) -> str:
