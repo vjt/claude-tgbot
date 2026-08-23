@@ -62,15 +62,18 @@ The `*HTML` variants send with `parse_mode=HTML` (Telegram subset: `<b>`, `<i>`,
 
 ## Authorization
 
-Three lists in the **consumer's** `.env`:
+Four lists in the **consumer's** `.env`:
 
 - `TELEGRAM_ADMIN_USER_IDS` — full access + receive permission-prompt DMs.
 - `TELEGRAM_PUBLISHER_USER_IDS` — full access, no permission DMs.
+- `TELEGRAM_VIEWER_USER_IDS` — reach the agent, carry **no authority**. Events are forwarded tagged `role=viewer`; the agent does not execute their requests. Never receive permission DMs.
 - `TELEGRAM_ALLOWED_CHAT_IDS` — chats the bot listens in.
 
-Allowed users = union of admins and publishers. Chat must match too. Non-listed users get `DENIED` on stdout and **never** surface as `MSG` / `DOCUMENT` / `PHOTO` / `COMMAND` / `CALLBACK`. This is the only trust boundary — do not move it into the agent.
+Allowed users = union of admins, publishers and viewers. Chat must match too. Non-listed users get `DENIED` on stdout and **never** surface as `MSG` / `DOCUMENT` / `PHOTO` / `COMMAND` / `CALLBACK`. This is the only trust boundary — do not move it into the agent.
 
-Every forwarded event carries a `role=admin|publisher` suffix so the agent can differentiate behaviour (e.g. confirm destructive commands only when role=publisher).
+Every forwarded event carries a `role=admin|publisher|viewer` suffix so the agent can differentiate behaviour (e.g. confirm destructive commands only when role=publisher; refuse instructions outright when role=viewer). Role precedence is admin > publisher > viewer: an id listed twice resolves to the strongest.
+
+**The viewer boundary is agent-side by design.** The bridge cannot distinguish "read the room" from "do this for me" — only the agent can. A viewer is someone the operator wants present in the chat and visible to the agent, without granting them the ability to task it. Bridge stays transport; policy stays in the agent.
 
 `/start` is the sole exception: it always answers, because it's how new users learn their own `user_id` and `chat_id` for the operator to add them.
 

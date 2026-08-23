@@ -140,7 +140,11 @@ def _parse_ids(spec: str) -> set[int]:
 
 ADMIN_USER_IDS = _parse_ids(ENV.get("TELEGRAM_ADMIN_USER_IDS", ""))
 PUBLISHER_USER_IDS = _parse_ids(ENV.get("TELEGRAM_PUBLISHER_USER_IDS", ""))
-ALLOWED_USER_IDS = ADMIN_USER_IDS | PUBLISHER_USER_IDS  # union = can reach the agent
+# Viewers reach the agent but carry no authority: the bridge forwards their
+# events like anyone else's, and the agent decides what (not) to do with them.
+# The distinction is enforced agent-side via the role tag, not here.
+VIEWER_USER_IDS = _parse_ids(ENV.get("TELEGRAM_VIEWER_USER_IDS", ""))
+ALLOWED_USER_IDS = ADMIN_USER_IDS | PUBLISHER_USER_IDS | VIEWER_USER_IDS  # union = can reach the agent
 # Private chats have chat_id == user_id on Telegram, so an allowed user DMing
 # the bot (for /start bootstrap, for receiving permission-prompt DMs) is by
 # definition in a chat the agent should accept. Group chat_ids still come from
@@ -153,6 +157,8 @@ def _role_of(user_id: int) -> str:
         return "admin"
     if user_id in PUBLISHER_USER_IDS:
         return "publisher"
+    if user_id in VIEWER_USER_IDS:
+        return "viewer"
     return "none"
 
 

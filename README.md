@@ -72,6 +72,7 @@ TELEGRAM_BOT_TOKEN=<from_BotFather>
 TELEGRAM_BOT_USERNAME=<bot_username_without_@>
 TELEGRAM_ADMIN_USER_IDS=<id_of_operator>
 TELEGRAM_PUBLISHER_USER_IDS=<id_of_publisher>
+TELEGRAM_VIEWER_USER_IDS=<id_of_viewer>
 TELEGRAM_ALLOWED_CHAT_IDS=<chat_id>
 ```
 
@@ -91,15 +92,18 @@ printf 'TYPING -1003456789\n' > ~/code/<consumer>/bot.send
 
 ## Trust model
 
-Hard boundary at the bot layer, not the LLM layer. Two roles, one chat scope:
+Hard boundary at the bot layer, not the LLM layer. Three roles, one chat scope:
 
 - **admins** (`TELEGRAM_ADMIN_USER_IDS`) — full access, and receive permission-prompt DMs from the Claude Code hook when the agent attempts a tool outside its allow-list.
 - **publishers** (`TELEGRAM_PUBLISHER_USER_IDS`) — can talk to the bot (messages, documents, commands) but do not receive permission prompts.
+- **viewers** (`TELEGRAM_VIEWER_USER_IDS`) — reach the agent but carry **no authority**. Their events are forwarded tagged `role=viewer` and the agent does not act on their instructions. Use for people who should be present in the chat and visible to the agent without being able to task it. No permission prompts.
 - **everyone else** — events from non-listed users are logged to `bot.log` and reported as `DENIED` on stdout, but **never forwarded** to the agent as `MSG` / `DOCUMENT` / `PHOTO` / `COMMAND`.
 
 Additionally, `update.effective_chat.id` must be in `TELEGRAM_ALLOWED_CHAT_IDS`. An admin messaging from an unknown chat is still denied.
 
-Every forwarded event carries a `role=admin|publisher` tag so the agent can differentiate (e.g. act on an admin's `/status` without asking, ask confirmation for a publisher's destructive command).
+Every forwarded event carries a `role=admin|publisher|viewer` tag so the agent can differentiate (e.g. act on an admin's `/status` without asking, ask confirmation for a publisher's destructive command, decline a viewer's outright). Precedence is admin > publisher > viewer, so an id listed in two lists resolves to the strongest.
+
+**Note the asymmetry:** admin/publisher/none are enforced by the bridge, `viewer` is not — the bridge lets viewer traffic through and the *agent* withholds action. A viewer is therefore a policy role, not a security boundary: it keeps an untrusted-but-welcome participant visible without granting them control, but it does not protect against an agent that ignores the tag.
 
 Telegram's identity is stronger than IRC's (numeric ids, not nicks), so there is no separate host-glob / services check like claude-ircbot's `bot.trust`.
 
@@ -112,12 +116,12 @@ Telegram's identity is stronger than IRC's (numeric ids, not nicks), so there is
 ```
 READY
 FIFO_READY <path>
-MSG       <chat_id> <msg_id> <json_text>        user=<username> role=<admin|publisher>
-DOCUMENT  <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher>
-PHOTO     <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher>
-COMMAND   <chat_id> <msg_id> <cmd> args=<json>  user=<username> role=<admin|publisher>
-CALLBACK  <chat_id> <msg_id> <json_data>        user=<username> role=<admin|publisher>
-IDENTIFY  chat_id=<n> user_id=<n> username=<s>  role=<admin|publisher|none>
+MSG       <chat_id> <msg_id> <json_text>        user=<username> role=<admin|publisher|viewer>
+DOCUMENT  <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher|viewer>
+PHOTO     <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher|viewer>
+COMMAND   <chat_id> <msg_id> <cmd> args=<json>  user=<username> role=<admin|publisher|viewer>
+CALLBACK  <chat_id> <msg_id> <json_data>        user=<username> role=<admin|publisher|viewer>
+IDENTIFY  chat_id=<n> user_id=<n> username=<s>  role=<admin|publisher|viewer|none>
 DENIED       <kind>     user_id=<n> chat_id=<n>    username=<s>
 MARKUP_ERROR <chat_id>  <path_or_dash> <json_detail>
 ERROR        <stage>    <detail>
