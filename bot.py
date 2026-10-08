@@ -12,6 +12,7 @@ Events emitted to stdout (one line each, JSON-quoted text fields):
   MSG <chat_id> <msg_id> <json_text> user=<username>
   DOCUMENT <chat_id> <msg_id> <path> user=<username>
   PHOTO <chat_id> <msg_id> <path> user=<username>
+  VOICE <chat_id> <msg_id> <path> duration=<s> user=<username>
   COMMAND <chat_id> <msg_id> <cmd> args=<json_args> user=<username>
   CALLBACK <chat_id> <msg_id> <json_data> user=<username>
   IDENTIFY chat_id=<n> user_id=<n> username=<s>
@@ -31,6 +32,7 @@ FIFO verbs (one per line written to bot.send):
   TYPING <chat_id>
   DOCUMENT <chat_id> <path> [caption]
   PHOTO <chat_id> <path> [caption]
+  VOICE <chat_id> <reply_to_msg_id|0> <path.ogg> [caption]
   EDIT <chat_id> <msg_id> <text>
   KEYBOARD <chat_id> <reply_to_msg_id> <json_payload>
   BAN <chat_id> <user_id>
@@ -337,6 +339,34 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     log("<", f"PHOTO chat={update.effective_chat.id} msg={m.message_id} path={path}")
 
 
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Voice notes and audio files land in the inbox; transcription is the
+    consumer's business (the bridge stays dependency-free)."""
+    ok, _ = _authorize(update)
+    if not ok:
+        await _deny(update, "VOICE", "not authorized")
+        return
+    m = update.effective_message
+    if not m:
+        return
+    media = m.voice or m.audio
+    if not media:
+        return
+    if media.file_size and media.file_size > MAX_FILE_BYTES:
+        await m.reply_text(f"audio too big (> {MAX_FILE_BYTES // (1024*1024)} MB), rejected")
+        emit("ERROR", "voice-too-big", f"size={media.file_size}")
+        return
+    name = getattr(media, "file_name", None) or f"voice_{media.file_unique_id}.oga"
+    try:
+        path = await _download_to_inbox(media.file_id, name, context.bot)
+    except Exception as e:
+        emit("ERROR", "voice-download", repr(e))
+        return
+    emit("VOICE", update.effective_chat.id, m.message_id, str(path),
+         f"duration={media.duration or 0}", _tail(update))
+    log("<", f"VOICE chat={update.effective_chat.id} msg={m.message_id} path={path}")
+
+
 def _parse_command(text: str) -> tuple[str, str]:
     """Extract the command name + raw argument string from a slash-command
     message body. Strips `/`, handles Telegram's optional `@botname` suffix
@@ -609,6 +639,21 @@ async def process_cmd(app: Application, line: str) -> None:
             caption = _unescape_body(parts[2]) if len(parts) > 2 else None
             with open(path, "rb") as fh:
                 await bot.send_photo(chat_id=int(target), photo=fh, caption=caption)
+        elif verb == "VOICE":
+            # Telegram renders a voice bubble only for OGG/Opus; the sender
+            # encodes. The file is unlinked on success, like the *FILE verbs.
+            parts = _split(rest, 3)
+            target, reply_to, path = parts[0], int(parts[1]), parts[2]
+            caption = _unescape_body(parts[3]) if len(parts) > 3 else None
+            kw: dict = {"chat_id": int(target), "caption": caption}
+            if reply_to:
+                kw["reply_to_message_id"] = reply_to
+            with open(path, "rb") as fh:
+                await bot.send_voice(voice=fh, **kw)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         elif verb == "EDIT":
             target, msg_id, text = _split(rest, 2)
             await bot.edit_message_text(chat_id=int(target), message_id=int(msg_id), text=_unescape_body(text))
@@ -717,6 +762,7 @@ def main() -> int:
     app.add_handler(MessageHandler(filters.COMMAND, on_any_command))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_handler(CallbackQueryHandler(on_callback))
 

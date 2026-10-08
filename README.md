@@ -13,7 +13,7 @@ Not a one-click deploy. This is infrastructure — run it yourself on a host you
 ## How it works
 
 - **Telegram bot client** (`python-telegram-bot` v21+). Long-polls the Bot API, handles text messages, documents, photos, inline-keyboard callbacks, and slash commands. The bot only interprets `/start` (identity bootstrap); every other `/command` is forwarded to the agent as a `COMMAND` event, so the vocabulary is owned by whatever consumer you're driving.
-- **Structured stdout** — one line per event (`MSG`, `DOCUMENT`, `PHOTO`, `COMMAND`, `CALLBACK`, `IDENTIFY`, `DENIED`, errors). Claude Code's [Monitor tool](https://code.claude.com/docs/en/agent-sdk/typescript#monitor) tails the bot's stdout log and delivers each line as a notification mid-conversation.
+- **Structured stdout** — one line per event (`MSG`, `DOCUMENT`, `PHOTO`, `VOICE`, `COMMAND`, `CALLBACK`, `IDENTIFY`, `DENIED`, errors). Claude Code's [Monitor tool](https://code.claude.com/docs/en/agent-sdk/typescript#monitor) tails the bot's stdout log and delivers each line as a notification mid-conversation.
 - **Named-pipe inbox** (`bot.send`). The agent writes commands like `SAY -1003456789 hello` or `REPLY <chat> <msg_id> ok` into the pipe; the bot translates them into Telegram API calls.
 - **Async-native FIFO reader** — the pipe is registered on the asyncio event loop via `loop.add_reader()`, opened `O_RDWR | O_NONBLOCK` so the kernel never surfaces EOF when an external writer closes. No thread, no blocking.
 - **Optional AUP / idle / turns watchdog** (`aup_watchdog.py`) — sidecar process that tails the active Claude Code session's jsonl and injects `/clear` into the driven tmux pane on Anthropic-policy refusals, after a configurable number of assistant turns, or when the session has been idle. Keeps long-running sessions from wedging without operator intervention.
@@ -119,6 +119,7 @@ FIFO_READY <path>
 MSG       <chat_id> <msg_id> <json_text>        user=<username> role=<admin|publisher|viewer>
 DOCUMENT  <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher|viewer>
 PHOTO     <chat_id> <msg_id> <local_path>       user=<username> role=<admin|publisher|viewer>
+VOICE     <chat_id> <msg_id> <local_path> duration=<s> user=<username> role=<admin|publisher|viewer>
 COMMAND   <chat_id> <msg_id> <cmd> args=<json>  user=<username> role=<admin|publisher|viewer>
 CALLBACK  <chat_id> <msg_id> <json_data>        user=<username> role=<admin|publisher|viewer>
 IDENTIFY  chat_id=<n> user_id=<n> username=<s>  role=<admin|publisher|viewer|none>
@@ -143,6 +144,7 @@ REPLYFILEHTML  <chat_id> <msg_id> <path>
 TYPING         <chat_id>
 DOCUMENT       <chat_id> <path> [caption]
 PHOTO          <chat_id> <path> [caption]
+VOICE          <chat_id> <reply_to_msg_id|0> <path.ogg> [caption]   # OGG/Opus; unlinked on success
 EDIT           <chat_id> <msg_id> <text>
 KEYBOARD       <chat_id> <reply_to_msg_id|0> <json_payload>
 BAN            <chat_id> <user_id>

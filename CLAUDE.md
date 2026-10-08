@@ -53,7 +53,7 @@ Sync from the agent side. Verbs are the stable API surface. Adding a verb is che
 ```
 SAY / SAYFILE / SAYHTML / SAYFILEHTML /
 REPLY / REPLYFILE / REPLYHTML / REPLYFILEHTML /
-TYPING / DOCUMENT / PHOTO / EDIT / KEYBOARD / BAN / QUIT
+TYPING / DOCUMENT / PHOTO / VOICE / EDIT / KEYBOARD / BAN / QUIT
 ```
 
 Text bodies on `SAY` / `REPLY` / `EDIT` / `SAYHTML` / `REPLYHTML` (and `DOCUMENT` / `PHOTO` captions) accept two-char escapes — `\n` → newline, `\t` → tab, `\\` → backslash — so senders can emit short multi-line messages despite the FIFO being newline-delimited. Anything longer or containing shell-fragile characters should use the file verbs (`SAYFILE` / `REPLYFILE` / `SAYFILEHTML` / `REPLYFILEHTML`): sender writes the body to any UTF-8 file path, verb points at the path, bot reads raw (newlines preserved), auto-chunks at 4000 chars, and unlinks on success. This is the authoritative wire format — keep the bot-side list in `bot.py`, the maintainer doc here, and the public README (`### FIFO verbs`) in sync whenever you add or rename a verb.
